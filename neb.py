@@ -9,6 +9,7 @@ from hoomd.data.parameterdicts import ParameterDict
 from hoomd.data import syncedlist
 from hoomd.data.typeconverter import OnlyTypes, positive_real
 from hoomd.logging import log
+from hoomd.neb_plugin import _neb_plugin
 from hoomd.md import _md
 from hoomd.md.integrate import _DynamicIntegrator
 
@@ -247,16 +248,17 @@ class NEB(_DynamicIntegrator):
 
         methods_list = syncedlist.SyncedList(
             OnlyTypes((hoomd.md.methods.NVE, hoomd.md.methods.NPH,
-                       hoomd.md.methods.rattle.NVE)),
+                       hoomd.md.methods.rattle.NVE,
+                       hoomd.md.methods.DisplacementCapped)),
             syncedlist._PartialGetAttr("_cpp_obj"),
             iterable=methods)
         self._methods = methods_list
 
     def _attach_hook(self):
         if isinstance(self._simulation.device, hoomd.device.CPU):
-            cls = getattr(_md, self._cpp_class_name)
+            cls = getattr(_neb_plugin, self._cpp_class_name)
         else:
-            cls = getattr(_md, self._cpp_class_name + "GPU")
+            cls = getattr(_neb_plugin, self._cpp_class_name + "GPU")
         self._cpp_obj = cls(self._simulation.state._cpp_sys_def, self.dt)
         super()._attach_hook()
 
@@ -278,13 +280,21 @@ class NEB(_DynamicIntegrator):
         return self._cpp_obj.reset()
 
     def couple_left(self, left_minimizer):
-        self._cpp_obj.couple_left(left_minimizer._cpp_obj)
+        self._cpp_obj.coupleLeft(left_minimizer._cpp_obj, False)
 
     def couple_right(self, right_minimizer):
-        self._cpp_obj.couple_right(right_minimizer._cpp_obj)
+        self._cpp_obj.coupleRight(right_minimizer._cpp_obj, False)
 
     def uncouple_left(self):
-        self._cpp_obj.uncouple_left()
+        self._cpp_obj.uncoupleLeft(False)
     
     def uncouple_right(self):
-        self._cpp_obj.uncouple_right()
+        self._cpp_obj.uncoupleRight(False)
+
+    @property
+    def nudge(self):
+        return self._cpp_obj.getNudge()
+
+    @nudge.setter
+    def nudge(self, value):
+        self._cpp_obj.setNudge(value)

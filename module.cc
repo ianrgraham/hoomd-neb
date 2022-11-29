@@ -22,6 +22,7 @@ namespace md
 PYBIND11_MODULE(_neb_plugin, m)
     {
     detail::export_NEBEnergyMinimizer(m);
+    detail::export_NEBHook(m);
 #ifdef ENABLE_HIP
     // detail::export_NEBEnergyMinimizerGPU(m);
 #endif

@@ -2,6 +2,7 @@
 // Part of HOOMD-blue, released under the BSD 3-Clause License.
 
 #include "hoomd/md/IntegratorTwoStep.h"
+#include "hoomd/HalfStepHook.h"
 
 #include <memory>
 #include <barrier>
@@ -28,7 +29,7 @@ namespace md
 
     \ingroup updaters
 */
-class PYBIND11_EXPORT NEBEnergyMinimizer : public IntegratorTwoStep, public std::enable_shared_from_this<NEBEnergyMinimizer>
+class PYBIND11_EXPORT NEBEnergyMinimizer : public IntegratorTwoStep
     {
     public:
     //! Constructs the minimizer and associates it with the system
@@ -181,8 +182,8 @@ class PYBIND11_EXPORT NEBEnergyMinimizer : public IntegratorTwoStep, public std:
     void coupleRight(std::shared_ptr<NEBEnergyMinimizer> minimizer, bool update_other = true)
         {
         m_right_minimizer = minimizer;
-        if (update_other)
-            minimizer->coupleLeft(shared_from_this(), false);
+        // if (update_other)
+        //     minimizer->coupleLeft(shared_from_this(), false);
         updateBarrier();
         }
 
@@ -197,8 +198,8 @@ class PYBIND11_EXPORT NEBEnergyMinimizer : public IntegratorTwoStep, public std:
     void coupleLeft(std::shared_ptr<NEBEnergyMinimizer> minimizer, bool update_other = true)
         {
         m_left_minimizer = minimizer;
-        if (update_other)
-            minimizer->coupleRight(shared_from_this(), false);
+        // if (update_other)
+        //     minimizer->coupleRight(shared_from_this(), false);
         updateBarrier();
         }
 
@@ -227,18 +228,32 @@ class PYBIND11_EXPORT NEBEnergyMinimizer : public IntegratorTwoStep, public std:
         return m_sysdef;
         }
 
-    void arriveAtBarrier() {
+    std::optional<std::barrier<std::__empty_completion>::arrival_token> arriveAtBarrier() {
         if (m_barrier)
-            m_barrier->get()->arrive();
+            return m_barrier->get()->arrive();
+        else
+            throw std::runtime_error("No barrier to arrive at");
+    }
+
+    void waitAtBarrier(std::optional<std::barrier<std::__empty_completion>::arrival_token> token) {
+        if (token)
+            m_barrier->get()->wait(std::move(token.value()));
     }
 
     void arriveAndWaitAtBarriers() {
+        std::optional<std::barrier<std::__empty_completion>::arrival_token> right_token;
+        std::optional<std::barrier<std::__empty_completion>::arrival_token> left_token;
         if (m_right_minimizer)
-            m_right_minimizer->get()->arriveAtBarrier();
+            right_token = m_right_minimizer->get()->arriveAtBarrier();
         if (m_left_minimizer)
-            m_left_minimizer->get()->arriveAtBarrier();
+            left_token = m_left_minimizer->get()->arriveAtBarrier();
         if (m_barrier)
             m_barrier->get()->arrive_and_wait();
+        if (m_right_minimizer)
+            m_right_minimizer->get()->waitAtBarrier(std::move(right_token));
+        if (m_left_minimizer)
+            m_left_minimizer->get()->waitAtBarrier(std::move(left_token));
+        
     }
 
     std::shared_ptr<ParticleData> getParticleData() const
@@ -253,7 +268,20 @@ class PYBIND11_EXPORT NEBEnergyMinimizer : public IntegratorTwoStep, public std:
 
     void resizeBuffers();
 
-    bool nudgeForce();
+    bool nudgeForce(uint64_t timeste);
+
+    void setNudge(bool nudge)
+        {
+        m_nudge = nudge;
+        }
+
+    bool getNudge()
+        {
+        return m_nudge;
+        }
+
+    bool m_nudge;
+    bool m_do_integration;
 
     protected:
     //! Function to create the underlying integrator
@@ -292,9 +320,25 @@ class PYBIND11_EXPORT NEBEnergyMinimizer : public IntegratorTwoStep, public std:
     private:
     };
 
+
+class PYBIND11_EXPORT NEBHook: public HalfStepHook
+    {
+    public:
+    NEBHook(NEBEnergyMinimizer* neb);
+    NEBHook(std::shared_ptr<NEBEnergyMinimizer> neb);
+
+    void setSystemDefinition(std::shared_ptr<SystemDefinition> sysdef);
+
+    void update(uint64_t timestep);
+
+    private:
+    NEBEnergyMinimizer* m_neb;
+    };
+
 namespace detail
     {
     void export_NEBEnergyMinimizer(pybind11::module& m);
+    void export_NEBHook(pybind11::module& m);
     } // end namespace detail
     } // end namespace md
     } // end namespace hoomd

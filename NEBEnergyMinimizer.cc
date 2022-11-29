@@ -13,6 +13,45 @@ namespace hoomd
     {
 namespace md
     {
+
+NEBHook::NEBHook(NEBEnergyMinimizer* neb) : m_neb(neb)
+    {
+    setSystemDefinition(m_neb->getSystemDefinition());
+    }
+
+NEBHook::NEBHook(std::shared_ptr<NEBEnergyMinimizer> neb)
+    {
+    setSystemDefinition(m_neb->getSystemDefinition());
+    }
+
+void NEBHook::update(uint64_t timestep)
+    {
+    m_neb->resizeBuffers();
+
+    // Arrive at the start of the integration step to synchronize the nudging of forces
+    m_neb->m_do_integration = true;
+    if (m_neb->m_nudge)
+        {
+        m_neb->arriveAndWaitAtBarriers();
+        // {
+        //     pybind11::gil_scoped_acquire acquire;
+        //     std::cout << timestep << " " << m_k << ": " << "compute nudge force" << std::endl;
+        // }
+
+        m_neb->m_do_integration = m_neb->nudgeForce(timestep);
+
+        m_neb->arriveAndWaitAtBarriers();
+        // {
+        //     pybind11::gil_scoped_acquire acquire;
+        //     std::cout << timestep << " " << m_k << ": " << do_integration << std::endl;
+        // }
+        }
+    }
+
+void NEBHook::setSystemDefinition(std::shared_ptr<SystemDefinition> sysdef)
+    {
+    }
+
 /*! \param sysdef SystemDefinition this method will act on. Must not be NULL.
     \param dt maximum step size
 
@@ -23,7 +62,7 @@ NEBEnergyMinimizer::NEBEnergyMinimizer(std::shared_ptr<SystemDefinition> sysdef,
       m_alpha_start(Scalar(0.1)), m_falpha(Scalar(0.99)), m_ftol(Scalar(1e-1)),
       m_wtol(Scalar(1e-1)), m_etol(Scalar(1e-3)), m_energy_total(Scalar(0.0)),
       m_old_energy(Scalar(0.0)), m_deltaT_max(dt), m_deltaT_set(dt / Scalar(10.0)),
-      m_run_minsteps(10), m_k(1.0)
+      m_run_minsteps(10), m_k(1.0), m_nudge(true), m_do_integration(true)
     {
     m_exec_conf->msg->notice(5) << "Constructing NEBEnergyMinimizer" << endl;
 
@@ -44,6 +83,9 @@ NEBEnergyMinimizer::NEBEnergyMinimizer(std::shared_ptr<SystemDefinition> sysdef,
     // m_tangent_force_buffer.swap(tangent_force_buffer);
     // GlobalArray<Scalar3> norm_force_buffer(N, m_exec_conf);
     // m_norm_force_buffer.swap(norm_force_buffer);
+
+    auto hook = std::make_shared<NEBHook>(this);
+    setHalfStepHook(hook);
     }
 
 NEBEnergyMinimizer::~NEBEnergyMinimizer()
@@ -153,7 +195,7 @@ void NEBEnergyMinimizer::resizeBuffers()
         }
     }
 
-bool NEBEnergyMinimizer::nudgeForce()
+bool NEBEnergyMinimizer::nudgeForce(uint64_t timestep)
     {
 
     if (!isDynamicNode())
@@ -162,9 +204,9 @@ bool NEBEnergyMinimizer::nudgeForce()
         }
 
     // get the neighbor positions and tags to assess the configuration space tangent vector
-    GlobalArray<Scalar4> net_force = m_pdata->getNetForce();
-    GlobalArray<Scalar4> pos = m_pdata->getPositions();
-    GlobalArray<unsigned int> tags = m_pdata->getTags();
+    const GlobalArray<Scalar4>& net_force = m_pdata->getNetForce();
+    const GlobalArray<Scalar4>& pos = m_pdata->getPositions();
+    const GlobalArray<unsigned int>& tags = m_pdata->getTags();
 
     ArrayHandle<Scalar4> h_net_force(net_force, access_location::host, access_mode::readwrite);
     ArrayHandle<Scalar4> h_pos(pos, access_location::host, access_mode::read);
@@ -212,7 +254,7 @@ bool NEBEnergyMinimizer::nudgeForce()
         Scalar4 pr = h_right_pos.data[right_idx];
 
         Scalar3 left_disp = global_box.minImage(
-            make_scalar3(pi.x - pl.x, pi.y = pl.y, pi.z - pl.z));
+            make_scalar3(pi.x - pl.x, pi.y - pl.y, pi.z - pl.z));
         Scalar3 right_disp = global_box.minImage(
             make_scalar3(pr.x - pi.x, pr.y - pi.y, pr.z - pi.z));
 
@@ -256,6 +298,13 @@ bool NEBEnergyMinimizer::nudgeForce()
         norm_force += dot(force, tangent);
         }
 
+    // if (timestep%100 == 0)
+    //     {
+    //     pybind11::gil_scoped_acquire acquire;
+    //     std::cout << "tstep: " << timestep << " tan_force: " << tan_force << " norm_force: " << norm_force << std::endl;
+    //     }
+    
+
     for (unsigned int i = 0; i < m_pdata->getN(); i++)
         {
         Scalar3 tangent = h_tangent.data[i];
@@ -272,7 +321,7 @@ bool NEBEnergyMinimizer::nudgeForce()
  */
 void NEBEnergyMinimizer::update(uint64_t timestep)
     {
-    Integrator::update(timestep);
+    // Integrator::update(timestep);
     // if (m_converged)
     //     return;
 
@@ -287,77 +336,69 @@ void NEBEnergyMinimizer::update(uint64_t timestep)
 
     // Calculate the per-particle potential energy over particles in the group
     Scalar energy(0.0);
-
-    resizeBuffers();
-
-    // Arrive at the start of the integration step to synchronize the nudging of forces
-    arriveAndWaitAtBarriers();
-
-    bool do_integration = nudgeForce();
-
-    arriveAndWaitAtBarriers();
-
-    if (do_integration)
-        {
         
-        unsigned int total_group_size = 0;
+    unsigned int total_group_size = 0;
 
+        {
+        const GlobalArray<Scalar4>& net_force = m_pdata->getNetForce();
+        ArrayHandle<Scalar4> h_net_force(net_force, access_location::host, access_mode::read);
+
+        // total potential energy
+        double pe_total = 0.0;
+
+        for (auto method = m_methods.begin(); method != m_methods.end(); ++method)
             {
-            const GlobalArray<Scalar4>& net_force = m_pdata->getNetForce();
-            ArrayHandle<Scalar4> h_net_force(net_force, access_location::host, access_mode::read);
+            std::shared_ptr<ParticleGroup> current_group = (*method)->getGroup();
+            unsigned int group_size = current_group->getNumMembers();
+            total_group_size += group_size;
 
-            // total potential energy
-            double pe_total = 0.0;
-
-            for (auto method = m_methods.begin(); method != m_methods.end(); ++method)
+            for (unsigned int group_idx = 0; group_idx < group_size; group_idx++)
                 {
-                std::shared_ptr<ParticleGroup> current_group = (*method)->getGroup();
-                unsigned int group_size = current_group->getNumMembers();
-                total_group_size += group_size;
-
-                for (unsigned int group_idx = 0; group_idx < group_size; group_idx++)
-                    {
-                    unsigned int j = current_group->getMemberIndex(group_idx);
-                    pe_total += (double)h_net_force.data[j].w;
-                    }
+                unsigned int j = current_group->getMemberIndex(group_idx);
+                pe_total += (double)h_net_force.data[j].w;
                 }
+            }
 
-            m_energy_total = pe_total;
+        m_energy_total = pe_total;
 
 #ifdef ENABLE_MPI
-            if (m_pdata->getDomainDecomposition())
-                {
-                throw runtime_error("NEB minimizer does not support MPI domain decomposition");
-                MPI_Allreduce(MPI_IN_PLACE,
-                            &pe_total,
-                            1,
-                            MPI_HOOMD_SCALAR,
-                            MPI_SUM,
-                            m_exec_conf->getMPICommunicator());
-                MPI_Allreduce(MPI_IN_PLACE,
-                            &total_group_size,
-                            1,
-                            MPI_INT,
-                            MPI_SUM,
-                            m_exec_conf->getMPICommunicator());
-                }
+        if (m_pdata->getDomainDecomposition())
+            {
+            throw runtime_error("NEB minimizer does not support MPI domain decomposition");
+            MPI_Allreduce(MPI_IN_PLACE,
+                        &pe_total,
+                        1,
+                        MPI_HOOMD_SCALAR,
+                        MPI_SUM,
+                        m_exec_conf->getMPICommunicator());
+            MPI_Allreduce(MPI_IN_PLACE,
+                        &total_group_size,
+                        1,
+                        MPI_INT,
+                        MPI_SUM,
+                        m_exec_conf->getMPICommunicator());
+            }
 #endif
 
-            energy = pe_total / Scalar(total_group_size);
-            }
+        energy = pe_total / Scalar(total_group_size);
+        }
 
-        if (m_was_reset)
-            {
-            m_was_reset = false;
-            m_old_energy = energy + Scalar(100000) * m_etol;
-            }
+    if (m_was_reset)
+        {
+        m_was_reset = false;
+        m_old_energy = energy + Scalar(100000) * m_etol;
+        }
 
-        ArrayHandle<Scalar4> h_vel(m_pdata->getVelocities(),
+    ArrayHandle<Scalar4> h_vel(m_pdata->getVelocities(),
+                            access_location::host,
+                            access_mode::readwrite);
+
+    if (m_do_integration)
+        {
+
+        ArrayHandle<Scalar3> h_accel(m_pdata->getAccelerations(),
                                 access_location::host,
                                 access_mode::readwrite);
-        ArrayHandle<Scalar3> h_accel(m_pdata->getAccelerations(),
-                                    access_location::host,
-                                    access_mode::readwrite);
 
 #ifdef ENABLE_MPI
         bool aniso = false;
@@ -460,6 +501,7 @@ void NEBEnergyMinimizer::update(uint64_t timestep)
 
             if (aniso)
                 {
+                throw std::runtime_error("NEB does not support anisotropic integration");
                 MPI_Allreduce(MPI_IN_PLACE,
                             &tnorm,
                             1,
@@ -627,8 +669,23 @@ void NEBEnergyMinimizer::update(uint64_t timestep)
                 }
             }
         m_n_since_start++;
-        m_old_energy = energy;
         }
+    else
+        {
+        for (auto method = m_methods.begin(); method != m_methods.end(); ++method)
+            {
+            std::shared_ptr<ParticleGroup> current_group = (*method)->getGroup();
+            unsigned int group_size = current_group->getNumMembers();
+            for (unsigned int group_idx = 0; group_idx < group_size; group_idx++)
+                {
+                unsigned int j = current_group->getMemberIndex(group_idx);
+                h_vel.data[j].x = 0.0;
+                h_vel.data[j].y = 0.0;
+                h_vel.data[j].z = 0.0;
+                }
+            }
+        }
+    m_old_energy = energy;
     }
 
 namespace detail
@@ -665,9 +722,18 @@ void export_NEBEnergyMinimizer(pybind11::module& m)
         .def("coupleLeft", &NEBEnergyMinimizer::coupleLeft)
         .def("coupleRight", &NEBEnergyMinimizer::coupleRight)
         .def("uncoupleLeft", &NEBEnergyMinimizer::uncoupleLeft)
-        .def("uncoupleRight", &NEBEnergyMinimizer::uncoupleRight);
+        .def("uncoupleRight", &NEBEnergyMinimizer::uncoupleRight)
+        .def("setNudge", &NEBEnergyMinimizer::setNudge)
+        .def("getNudge", &NEBEnergyMinimizer::getNudge);
     }
 
+void export_NEBHook(pybind11::module& m)
+    {
+    pybind11::class_<NEBHook, HalfStepHook, std::shared_ptr<NEBHook>>(
+        m,
+        "NEBHook")
+        .def(pybind11::init<std::shared_ptr<NEBEnergyMinimizer>>());
+    }
     } // end namespace detail
     } // end namespace md
     } // end namespace hoomd
