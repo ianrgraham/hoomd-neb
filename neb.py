@@ -13,6 +13,16 @@ from hoomd.neb_plugin import _neb_plugin
 from hoomd.md import _md
 from hoomd.md.integrate import _DynamicIntegrator
 
+import numpy as np
+import copy
+
+import freud
+import gsd.hoomd
+
+import multiprocessing.pool as mpp
+
+from typing import Callable
+
 
 class NEB(_DynamicIntegrator):
     """Nudged Elastic Band Energy Minimizer.
@@ -287,7 +297,7 @@ class NEB(_DynamicIntegrator):
 
     def uncouple_left(self):
         self._cpp_obj.uncoupleLeft(False)
-    
+
     def uncouple_right(self):
         self._cpp_obj.uncoupleRight(False)
 
@@ -298,3 +308,117 @@ class NEB(_DynamicIntegrator):
     @nudge.setter
     def nudge(self, value):
         self._cpp_obj.setNudge(value)
+
+
+def _make_snap(pos, init_snap):
+    snap = gsd.hoomd.Snapshot()
+    snap.configuration.box = init_snap.configuration.box
+    snap.configuration.dimensions = init_snap.configuration.dimensions
+    snap.particles.N = init_snap.particles.N
+    snap.particles.position = pos
+    snap.particles.types = init_snap.particles.types
+    snap.particles.diameter = init_snap.particles.diameter
+
+    return snap
+
+
+def _setup_node(sim, k, forces=None, filter=hoomd.filter.All()):
+    neb_integrator = NEB(0.01, 1e-3, 1e-3, 1e-3, k=k)
+    if forces is not None:
+        neb_integrator.forces = forces
+    nve = hoomd.md.methods.DisplacementCapped(filter, 0.01)
+    neb_integrator.methods = [nve]
+
+    sim.operations.integrator = neb_integrator
+
+    sim.run(0)
+
+
+def _make_node(pos, init_snap, device=hoomd.device.CPU(), k=1.0, forces=None, filter=hoomd.filter.All()):
+    sim = hoomd.Simulation(device=device)
+    snap = _make_snap(pos, init_snap)
+    sim.create_state_from_snapshot(snap)
+    _setup_node(sim, k, forces, filter)
+    return sim
+
+
+def _couple_neb_minimizers(sims):
+
+    for i in range(len(sims)):
+        minimizer = sims[i].operations.integrator
+        assert isinstance(minimizer, NEB)
+
+    for i in range(len(sims)-1):
+        left_minimizer = sims[i].operations.integrator
+        assert isinstance(left_minimizer, NEB)
+        right_minimizer = sims[i+1].operations.integrator
+        assert isinstance(right_minimizer, NEB)
+        left_minimizer.couple_right(right_minimizer)
+        right_minimizer.couple_left(left_minimizer)
+
+
+def _build_states(start: gsd.hoomd.Snapshot, end: gsd.hoomd.Snapshot, images, forces=None, filter=hoomd.filter.All()):
+    neb_sims = []
+    snap_pos = start.particles.position
+    future_pos = end.particles.position
+    freud_box = freud.Box.from_box(start.configuration.box)
+    neb_sims.append(_make_node(snap_pos, start, filter=filter, forces=copy.deepcopy(forces)))
+    disp = freud_box.wrap(future_pos - snap_pos)
+    for i in range(images):
+        f = float(i+1)/float(images+1)
+        pos = snap_pos + disp*f
+        neb_sims.append(_make_node(freud_box.wrap(pos), start, filter=filter, forces=copy.deepcopy(forces)))
+    neb_sims.append(_make_node(future_pos, start, filter=filter, forces=copy.deepcopy(forces)))
+
+    _couple_neb_minimizers(neb_sims)
+
+    return neb_sims
+
+
+class NEBDriver:
+
+    def __init__(self, initial: gsd.hoomd.Snapshot, final: gsd.hoomd.Snapshot, n_images: int = 10, func=None, filter=None, forces=None):
+        self._k = 1.0
+        self._n_images = n_images
+
+        assert initial.configuration.box == final.configuration.box
+
+        if filter is None:
+            filter = hoomd.filter.All()
+
+        self._neb_sims = _build_states(initial, final, n_images, filter=filter, forces=forces)
+
+    @property
+    def k(self):
+        return self._k
+
+    @k.setter
+    def k(self, value):
+        assert value > 0
+        self._k = value
+        for sim in self._neb_sims:
+            sim.operations.integrator.k = value
+
+    @property
+    def n_images(self):
+        return self._n_images
+
+    @property
+    def nodes(self):
+        return self._neb_sims
+
+    def apply(self, func: Callable[[hoomd.Simulation], None]):
+        for sim in self._neb_sims:
+            func(sim)
+
+    def apply_threaded(self, func: Callable[[hoomd.Simulation], None]):
+        with mpp.ThreadPool(self._n_images+2) as pool:
+            pool.map(func, self._neb_sims)
+
+    def run(self, steps: int):
+
+        def _run_no_gil(sim: hoomd.Simulation):
+            sim.run(steps, release_gil=True)
+
+        with mpp.ThreadPool(self._n_images+2) as pool:
+            pool.map(_run_no_gil, self._neb_sims)
