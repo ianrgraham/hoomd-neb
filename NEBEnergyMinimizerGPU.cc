@@ -34,19 +34,23 @@ void NEBHookGPU::update(uint64_t timestep)
     if (m_neb->m_nudge)
         {
         kernel::sync();
+        {
+            // pybind11::gil_scoped_acquire acquire;
+            // std::cout << timestep << "at barrier 1" << std::endl;
+        }
         m_neb->arriveAndWaitAtBarriers();
-        // {
-        //     pybind11::gil_scoped_acquire acquire;
-        //     std::cout << timestep << " " << m_k << ": " << "compute nudge force" << std::endl;
-        // }
+        {
+            // pybind11::gil_scoped_acquire acquire;
+            // std::cout << timestep << "computing nudge" << std::endl;
+        }
 
         m_neb->m_do_integration = m_neb->nudgeForce(timestep);
-
+        kernel::sync();
         m_neb->arriveAndWaitAtBarriers();
-        // {
-        //     pybind11::gil_scoped_acquire acquire;
-        //     std::cout << timestep << " " << m_k << ": " << do_integration << std::endl;
-        // }
+        {
+            // pybind11::gil_scoped_acquire acquire;
+            // std::cout << timestep << "passed barrier 2" << std::endl;
+        }
         }
     }
 

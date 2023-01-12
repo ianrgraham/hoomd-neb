@@ -233,8 +233,6 @@ hipError_t gpu_neb_nudge_force(const unsigned int N,
 
     // std::cout << "7: " << cudaGetLastError() << std::endl;
 
-    hipDeviceSynchronize();
-
     return hipSuccess;
     }
 

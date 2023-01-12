@@ -356,19 +356,33 @@ def _couple_neb_minimizers(sims):
         left_minimizer.couple_right(right_minimizer)
         right_minimizer.couple_left(left_minimizer)
 
+def _get_cpu():
+    return hoomd.device.CPU()
+
+def _get_gpu():
+    return hoomd.device.GPU()
 
 def _build_states(start: gsd.hoomd.Snapshot, end: gsd.hoomd.Snapshot, images, device, forces=None, filter=hoomd.filter.All()):
     neb_sims = []
     snap_pos = start.particles.position
     future_pos = end.particles.position
     freud_box = freud.Box.from_box(start.configuration.box)
-    neb_sims.append(_make_node(snap_pos, start, filter=filter, forces=copy.deepcopy(forces), device=device))
+
+    if device == "cpu":
+        device_producer = _get_cpu
+    elif device == "gpu":
+        device_producer = _get_gpu
+    else:
+        raise RuntimeError("Invalid device: {}".format(device))
+
+
+    neb_sims.append(_make_node(snap_pos, start, filter=filter, forces=copy.deepcopy(forces), device=device_producer()))
     disp = freud_box.wrap(future_pos - snap_pos)
     for i in range(images):
         f = float(i+1)/float(images+1)
         pos = snap_pos + disp*f
-        neb_sims.append(_make_node(freud_box.wrap(pos), start, filter=filter, forces=copy.deepcopy(forces), device=device))
-    neb_sims.append(_make_node(future_pos, start, filter=filter, forces=copy.deepcopy(forces), device=device))
+        neb_sims.append(_make_node(freud_box.wrap(pos), start, filter=filter, forces=copy.deepcopy(forces), device=device_producer()))
+    neb_sims.append(_make_node(future_pos, start, filter=filter, forces=copy.deepcopy(forces), device=device_producer()))
 
     _couple_neb_minimizers(neb_sims)
 
@@ -377,7 +391,7 @@ def _build_states(start: gsd.hoomd.Snapshot, end: gsd.hoomd.Snapshot, images, de
 
 class NEBDriver:
 
-    def __init__(self, initial: gsd.hoomd.Snapshot, final: gsd.hoomd.Snapshot, n_images: int = 10, func=None, filter=None, forces=None, device=None):
+    def __init__(self, initial: gsd.hoomd.Snapshot, final: gsd.hoomd.Snapshot, n_images: int = 10, func=None, filter=None, forces=None, device="cpu"):
         self._k = 1.0
         self._n_images = n_images
 
@@ -386,10 +400,7 @@ class NEBDriver:
         if filter is None:
             filter = hoomd.filter.All()
 
-        if device is None:
-            self._device = hoomd.device.GPU()
-        else:
-            self._device = device
+        assert device in ["cpu", "gpu"]
 
         self._neb_sims = _build_states(initial, final, n_images, device, filter=filter, forces=forces)
 
