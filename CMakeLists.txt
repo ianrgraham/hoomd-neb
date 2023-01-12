@@ -1,14 +1,31 @@
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+CMAKE_MINIMUM_REQUIRED(VERSION 3.9 FATAL_ERROR)
+
+# Name the plugin project
+project(plugins LANGUAGES C CXX)
+
+# Find the installed HOOMD
+find_package(HOOMD 3.0.0 REQUIRED)
+
+message(STATUS "Found HOOMD ${HOOMD_VERSION}: ${HOOMD_INSTALL_PREFIX}/${PYTHON_SITE_INSTALL_DIR}")
+
+# Force installation to the HOOMD installation location
+set(CMAKE_INSTALL_PREFIX ${HOOMD_INSTALL_PREFIX} CACHE PATH "Installation prefix" FORCE)
+endif()
 
 set(COMPONENT_NAME neb_plugin)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 set(_${COMPONENT_NAME}_sources
     module.cc
     NEBEnergyMinimizer.cc
-    # NEBEnergyMinimizerGPU.cc
+    NEBEnergyMinimizerGPU.cc
     )
 
 set(_${COMPONENT_NAME}_cu_sources
-    # NEBEnergyMinimizerGPU.cu
+    NEBEnergyMinimizerGPU.cu
     )
 
 if (ENABLE_HIP)

@@ -17,11 +17,28 @@ namespace md
     {
 namespace kernel
     {
+
+hipError_t sync();
+
 //! Kernel driver for zeroing velocities called by NEBEnergyMinimizerGPU
 hipError_t gpu_neb_zero_v(Scalar4* d_vel, unsigned int* d_group_members, unsigned int group_size);
 
 hipError_t
 gpu_neb_zero_angmom(Scalar4* d_angmom, unsigned int* d_group_members, unsigned int group_size);
+
+hipError_t gpu_neb_nudge_force(const unsigned int N,
+                                const BoxDim& box,
+                                Scalar4* d_net_force,
+                                const Scalar4* d_pos,
+                                const unsigned int* d_tags,
+                                Scalar3* d_tangent,
+                                Scalar3* d_left_disp,
+                                Scalar3* d_right_disp,
+                                const Scalar4* d_left_pos,
+                                const Scalar4* d_right_pos,
+                                const unsigned int* d_left_rtags,
+                                const unsigned int* d_right_rtags,
+                                const Scalar k);
 
 //! Kernel driver for summing the potential energy called by NEBEnergyMinimizerGPU
 hipError_t gpu_neb_compute_sum_pe(unsigned int* d_group_members,

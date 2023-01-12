@@ -29,7 +29,7 @@ namespace md
 
     \ingroup updaters
 */
-class PYBIND11_EXPORT NEBEnergyMinimizer : public IntegratorTwoStep
+class PYBIND11_EXPORT NEBEnergyMinimizer : public IntegratorTwoStep, public std::enable_shared_from_this<NEBEnergyMinimizer>
     {
     public:
     //! Constructs the minimizer and associates it with the system
@@ -268,7 +268,7 @@ class PYBIND11_EXPORT NEBEnergyMinimizer : public IntegratorTwoStep
 
     void resizeBuffers();
 
-    bool nudgeForce(uint64_t timeste);
+    virtual bool nudgeForce(uint64_t timestep);
 
     void setNudge(bool nudge)
         {
@@ -324,6 +324,7 @@ class PYBIND11_EXPORT NEBEnergyMinimizer : public IntegratorTwoStep
 class PYBIND11_EXPORT NEBHook: public HalfStepHook
     {
     public:
+    NEBHook();
     NEBHook(NEBEnergyMinimizer* neb);
     NEBHook(std::shared_ptr<NEBEnergyMinimizer> neb);
 

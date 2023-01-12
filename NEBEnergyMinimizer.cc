@@ -14,6 +14,8 @@ namespace hoomd
 namespace md
     {
 
+NEBHook::NEBHook() {}
+
 NEBHook::NEBHook(NEBEnergyMinimizer* neb) : m_neb(neb)
     {
     setSystemDefinition(m_neb->getSystemDefinition());
@@ -79,10 +81,6 @@ NEBEnergyMinimizer::NEBEnergyMinimizer(std::shared_ptr<SystemDefinition> sysdef,
     m_left_disp_buffer.swap(left_disp_buffer);
     GlobalArray<Scalar3> right_disp_buffer(N, m_exec_conf);
     m_right_disp_buffer.swap(right_disp_buffer);
-    // GlobalArray<Scalar3> tangent_force_buffer(N, m_exec_conf);
-    // m_tangent_force_buffer.swap(tangent_force_buffer);
-    // GlobalArray<Scalar3> norm_force_buffer(N, m_exec_conf);
-    // m_norm_force_buffer.swap(norm_force_buffer);
 
     auto hook = std::make_shared<NEBHook>(this);
     setHalfStepHook(hook);
@@ -190,8 +188,6 @@ void NEBEnergyMinimizer::resizeBuffers()
         m_tangent_buffer.resize(N);
         m_left_disp_buffer.resize(N);
         m_right_disp_buffer.resize(N);
-        // m_tangent_force_buffer.resize(N);
-        // m_norm_force_buffer.resize(N);
         }
     }
 
@@ -260,8 +256,8 @@ bool NEBEnergyMinimizer::nudgeForce(uint64_t timestep)
 
         h_left_disp.data[i] = left_disp;
         h_right_disp.data[i] = right_disp;
-        left_norm += dot(left_disp, left_disp);
-        right_norm += dot(right_disp, right_disp);
+        left_norm += dot((vec3<Scalar>)left_disp, (vec3<Scalar>)left_disp);
+        right_norm += dot((vec3<Scalar>)right_disp, (vec3<Scalar>)right_disp);
         }
     
     left_norm = 1.0 / sqrt(left_norm);
@@ -274,7 +270,7 @@ bool NEBEnergyMinimizer::nudgeForce(uint64_t timestep)
         Scalar3 right_disp = h_right_disp.data[i];
         Scalar3 tangent = left_norm * left_disp + right_norm * right_disp;
         h_tangent.data[i] = tangent;
-        tangent_norm += dot(tangent, tangent);
+        tangent_norm += dot((vec3<Scalar>)tangent, (vec3<Scalar>)tangent);
         }
 
     tangent_norm = 1.0 / sqrt(tangent_norm);
@@ -294,8 +290,8 @@ bool NEBEnergyMinimizer::nudgeForce(uint64_t timestep)
         Scalar3 left_disp = h_left_disp.data[i];
         Scalar3 right_disp = h_right_disp.data[i];
 
-        tan_force += dot(right_disp - left_disp, tangent);
-        norm_force += dot(force, tangent);
+        tan_force += dot((vec3<Scalar>)right_disp - (vec3<Scalar>)left_disp, (vec3<Scalar>)tangent);
+        norm_force += dot((vec3<Scalar>)force, (vec3<Scalar>)tangent);
         }
 
     // if (timestep%100 == 0)
@@ -321,7 +317,7 @@ bool NEBEnergyMinimizer::nudgeForce(uint64_t timestep)
  */
 void NEBEnergyMinimizer::update(uint64_t timestep)
     {
-    // Integrator::update(timestep);
+    Integrator::update(timestep);
     // if (m_converged)
     //     return;
 

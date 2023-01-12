@@ -4,4 +4,8 @@
 
 [x] Add pre-integration hook that modifies the forces to satisfy the conditions of the NEB minimization
 
-[ ] Write GPU implementation
+[x] Write GPU implementation
+
+[ ] Explore standalone HalfStepHook method
+
+[ ] Allow integration of angular degrees of freedom

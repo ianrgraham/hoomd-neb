@@ -9,6 +9,12 @@
 #include "hoomd/TextureTools.h"
 #include "hoomd/VectorMath.h"
 
+#include "thrust/transform_reduce.h"
+#include "thrust/functional.h"
+#include "thrust/device_ptr.h"
+#include "thrust/tuple.h"
+#include <thrust/iterator/zip_iterator.h>
+
 #include <assert.h>
 
 #include <stdio.h>
@@ -24,6 +30,214 @@ namespace md
     {
 namespace kernel
     {
+
+__global__ void gpu_neb_compute_disp_kernel(const unsigned int N,
+                                        const BoxDim box,
+                                        const Scalar4* d_pos,
+                                        const unsigned int* d_tags,
+                                        Scalar3* d_left_disp,
+                                        Scalar3* d_right_disp,
+                                        const Scalar4* d_left_pos,
+                                        const Scalar4* d_right_pos,
+                                        const unsigned int* d_left_rtags,
+                                        const unsigned int* d_right_rtags)
+    {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (i < N)
+        {
+        unsigned int tag = d_tags[i];
+        unsigned int left_idx = d_left_rtags[tag];
+        unsigned int right_idx = d_right_rtags[tag];
+
+        Scalar4 pi = d_pos[i];
+        Scalar4 pl = d_left_pos[left_idx];
+        Scalar4 pr = d_right_pos[right_idx];
+
+        Scalar3 left_disp = box.minImage(
+            make_scalar3(pi.x - pl.x, pi.y - pl.y, pi.z - pl.z));
+        Scalar3 right_disp = box.minImage(
+            make_scalar3(pr.x - pi.x, pr.y - pi.y, pr.z - pi.z));
+
+        d_left_disp[i] = left_disp; // make_scalar3(0.0, 0.0, 0.0); //
+        d_right_disp[i] = right_disp;
+        }
+    }
+
+
+struct dot_kernel
+    {
+    __host__ __device__ Scalar operator()(const Scalar3& x) const {
+        return x.x*x.x + x.y*x.y + x.z*x.z;
+        }
+    };
+
+__global__ void gpu_neb_compute_tangent_kernel(const unsigned int N,
+                                            const Scalar3* d_left_disp,
+                                            const Scalar3* d_right_disp,
+                                            const Scalar left_norm,
+                                            const Scalar right_norm,
+                                            Scalar3* d_tangent)
+    {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (i < N)
+        {
+        Scalar3 left_disp = d_left_disp[i];
+        Scalar3 right_disp = d_right_disp[i];
+
+        Scalar3 tangent = left_disp * left_norm + right_disp * right_norm;
+
+        d_tangent[i] = tangent;
+        }
+    }
+
+typedef thrust::tuple<Scalar4, Scalar3, Scalar3, Scalar3> tuple4;
+
+struct nudge_kernel
+    {
+    Scalar k;
+    __host__ __device__ Scalar operator()(tuple4 t)
+        {
+        Scalar4 f = thrust::get<0>(t);
+        Scalar3 tangent = thrust::get<1>(t);
+        Scalar3 left_disp = thrust::get<2>(t);
+        Scalar3 right_disp = thrust::get<3>(t);
+
+        Scalar3 term = k * (right_disp - left_disp) - make_scalar3(f.x, f.y, f.z);
+
+        return dot(term, tangent);
+        }
+    };
+
+__global__ void gpu_neb_apply_nudge_kernel(const unsigned int N,
+                                            Scalar4 *d_net_force,
+                                            const Scalar3 *d_tangent,
+                                            Scalar nudge
+                                            )
+    {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (i < N)
+        {
+        Scalar3 nudge_force = d_tangent[i] * nudge;
+        d_net_force[i].x += nudge_force.x;
+        d_net_force[i].y += nudge_force.y;
+        d_net_force[i].z += nudge_force.z;
+        }
+    }
+
+hipError_t sync() {
+    return hipDeviceSynchronize();
+}
+
+hipError_t gpu_neb_nudge_force(const unsigned int N,
+                                const BoxDim& box,
+                                Scalar4* d_net_force,
+                                const Scalar4* d_pos,
+                                const unsigned int* d_tags,
+                                Scalar3* d_tangent,
+                                Scalar3* d_left_disp,
+                                Scalar3* d_right_disp,
+                                const Scalar4* d_left_pos,
+                                const Scalar4* d_right_pos,
+                                const unsigned int* d_left_rtags,
+                                const unsigned int* d_right_rtags,
+                                const Scalar k)
+    {
+    
+    int block_size = 256;
+    dim3 grid((N / block_size) + 1, 1, 1);
+    dim3 threads(block_size, 1, 1);
+    // auto L = box.getL();
+    // std::cout << "N: " << N << " box: "  << L.x << " " << L.y << " " << L.z << " " << std::endl;
+    // std::cout << "1: " << cudaGetErrorString(cudaGetLastError()) << std::endl;
+
+    thrust::device_ptr<Scalar3> dev_left_disp = thrust::device_pointer_cast(d_left_disp);
+    thrust::device_ptr<Scalar3> dev_right_disp = thrust::device_pointer_cast(d_right_disp);
+    thrust::device_ptr<Scalar3> dev_tangent = thrust::device_pointer_cast(d_tangent);
+    thrust::device_ptr<Scalar4> dev_net_force = thrust::device_pointer_cast(d_net_force);
+
+    dot_kernel unary_op;
+    thrust::plus<Scalar> binary_op;
+
+    // std::cout << "2: " << cudaGetErrorString(cudaGetLastError()) << std::endl;
+
+    // compute disp vectors (un-normalized)
+    hipLaunchKernelGGL((gpu_neb_compute_disp_kernel),
+                       dim3(grid),
+                       dim3(threads),
+                       0,
+                       0,
+                       N,
+                       box,
+                       d_pos,
+                       d_tags,
+                       d_left_disp,
+                       d_right_disp,
+                       d_left_pos,
+                       d_right_pos,
+                       d_left_rtags,
+                       d_right_rtags);
+
+    // std::cout << "3: " << cudaGetErrorString(cudaGetLastError()) << std::endl;
+
+    // hipDeviceSynchronize();
+
+    // normalize disp vectors
+    Scalar left_norm = 1.0/sqrt(thrust::transform_reduce(dev_left_disp, dev_left_disp + N, unary_op, 0.0, binary_op));
+
+    Scalar right_norm = 1.0/sqrt(thrust::transform_reduce(dev_right_disp, dev_right_disp + N, unary_op, 0.0, binary_op));
+
+    // std::cout << "4: " << cudaGetErrorString(cudaGetLastError()) << std::endl;
+
+    // compute tangent vector (un-normalized)
+    hipLaunchKernelGGL((gpu_neb_compute_tangent_kernel),
+                        dim3(grid),
+                        dim3(threads),
+                        0,
+                        0,
+                        N,
+                        d_left_disp,
+                        d_right_disp,
+                        left_norm,
+                        right_norm,
+                        d_tangent);
+
+    hipDeviceSynchronize();
+
+    // std::cout << "5: " << cudaGetErrorString(cudaGetLastError()) << std::endl;
+
+    // normalize tangent vector
+    Scalar tangent_norm = 1.0/sqrt(thrust::transform_reduce(dev_tangent, dev_tangent + N, unary_op, 0.0, binary_op));
+
+    // compute nudge force
+    // first reduce to get tan and normal force components
+    auto zip_begin = thrust::make_zip_iterator(thrust::make_tuple(dev_net_force, dev_tangent, dev_left_disp, dev_right_disp));
+    auto zip_end = zip_begin + N;
+    Scalar nudge = thrust::transform_reduce(zip_begin, zip_end, nudge_kernel{k}, 0.0, binary_op);
+
+    // std::cout << "6: " << cudaGetLastError() << std::endl;
+
+
+    // then apply to net_force
+    hipLaunchKernelGGL((gpu_neb_apply_nudge_kernel),
+                        dim3(grid),
+                        dim3(threads),
+                        0,
+                        0,
+                        N,
+                        d_net_force,
+                        d_tangent,
+                        nudge);
+
+    // std::cout << "7: " << cudaGetLastError() << std::endl;
+
+    hipDeviceSynchronize();
+
+    return hipSuccess;
+    }
+
 //! The kernel function to zeros velocities, called by gpu_neb_zero_v()
 /*! \param d_vel device array of particle velocities
     \param d_group_members Device array listing the indices of the members of the group to zero

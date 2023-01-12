@@ -38,6 +38,7 @@ class PYBIND11_EXPORT NEBEnergyMinimizerGPU : public NEBEnergyMinimizer
 
     //! Iterates forward one step
     virtual void update(uint64_t timestep);
+    virtual bool nudgeForce(uint64_t timestep);
 
     protected:
     unsigned int m_block_size; //!< block size for partial sum memory
@@ -53,6 +54,25 @@ class PYBIND11_EXPORT NEBEnergyMinimizerGPU : public NEBEnergyMinimizer
     void resizePartialSumArrays();
     };
 
+class PYBIND11_EXPORT NEBHookGPU: public NEBHook
+    {
+    public:
+    NEBHookGPU(NEBEnergyMinimizerGPU* neb);
+    NEBHookGPU(std::shared_ptr<NEBEnergyMinimizerGPU> neb);
+
+    void setSystemDefinition(std::shared_ptr<SystemDefinition> sysdef);
+
+    void update(uint64_t timestep);
+
+    private:
+    NEBEnergyMinimizerGPU* m_neb;
+    };
+
+namespace detail
+    {
+    void export_NEBEnergyMinimizerGPU(pybind11::module& m);
+    void export_NEBHookGPU(pybind11::module& m);
+    } // end namespace detail
     } // end namespace md
     } // end namespace hoomd
 
