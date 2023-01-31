@@ -34,7 +34,7 @@ class PYBIND11_EXPORT NEBEnergyMinimizerGPU : public NEBEnergyMinimizer
     NEBEnergyMinimizerGPU(std::shared_ptr<SystemDefinition>, Scalar);
 
     //! Destroys the minimizer
-    virtual ~NEBEnergyMinimizerGPU() { }
+    // virtual ~NEBEnergyMinimizerGPU() { }
 
     //! Iterates forward one step
     virtual void update(uint64_t timestep);
@@ -42,6 +42,11 @@ class PYBIND11_EXPORT NEBEnergyMinimizerGPU : public NEBEnergyMinimizer
 
     protected:
     unsigned int m_block_size; //!< block size for partial sum memory
+
+    GPUVector<Scalar> m_neb_partial_sum1;
+    GPUVector<Scalar> m_neb_partial_sum2;
+    GPUArray<Scalar> m_neb_sum1;
+    GPUArray<Scalar> m_neb_sum2;
 
     GPUVector<Scalar> m_partial_sum1; //!< memory space for partial sum over P and E
     GPUVector<Scalar> m_partial_sum2; //!< memory space for partial sum over vsq
@@ -51,6 +56,7 @@ class PYBIND11_EXPORT NEBEnergyMinimizerGPU : public NEBEnergyMinimizer
 
     private:
     //! allocate the memory needed to store partial sums
+    void resizeNEBPartialSumArrays(unsigned int N);
     void resizePartialSumArrays();
     };
 
@@ -66,6 +72,7 @@ class PYBIND11_EXPORT NEBHookGPU: public NEBHook
 
     private:
     NEBEnergyMinimizerGPU* m_neb;
+    std::shared_ptr<const ExecutionConfiguration> m_exec_conf;
     };
 
 namespace detail

@@ -434,7 +434,7 @@ class NEBDriver:
     def run(self, steps: int):
 
         def _run_no_gil(sim: hoomd.Simulation):
-            sim.run(steps, release_gil=True)
+            sim.run(steps)
 
         with mpp.ThreadPool(self._n_images+2) as pool:
             pool.map(_run_no_gil, self._neb_sims)

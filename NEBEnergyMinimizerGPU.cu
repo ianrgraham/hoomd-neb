@@ -31,6 +31,46 @@ namespace md
 namespace kernel
     {
 
+//! Kernel function for reducing a partial sum to a full sum (one value)
+/*! \param d_sum Placeholder for the sum
+    \param d_partial_sum Array containing the partial sum
+    \param num_blocks Number of blocks to execute
+*/
+__global__ void
+gpu_neb_reduce_partial_sum_kernel(Scalar* d_sum, Scalar* d_partial_sum, unsigned int num_blocks)
+    {
+    extern __shared__ Scalar neb_sdata[];
+
+    Scalar sum = Scalar(0.0);
+
+    // sum up the values in the partial sum via a sliding window
+    for (int start = 0; start < num_blocks; start += blockDim.x)
+        {
+        __syncthreads();
+        if (start + threadIdx.x < num_blocks)
+            neb_sdata[threadIdx.x] = d_partial_sum[start + threadIdx.x];
+        else
+            neb_sdata[threadIdx.x] = Scalar(0.0);
+        __syncthreads();
+
+        // reduce the sum in parallel
+        int offs = blockDim.x >> 1;
+        while (offs > 0)
+            {
+            if (threadIdx.x < offs)
+                neb_sdata[threadIdx.x] += neb_sdata[threadIdx.x + offs];
+            offs >>= 1;
+            __syncthreads();
+            }
+
+        // everybody sums up sum2K
+        sum += neb_sdata[0];
+        }
+
+    if (threadIdx.x == 0)
+        *d_sum = sum;
+    }
+
 __global__ void gpu_neb_compute_disp_kernel(const unsigned int N,
                                         const BoxDim box,
                                         const Scalar4* d_pos,
@@ -81,12 +121,15 @@ __global__ void gpu_neb_compute_tangent_kernel(const unsigned int N,
     {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
 
+    // assert(!isnan(*left_norm));
+    // assert(!isnan(*right_norm));
+
     if (i < N)
         {
         Scalar3 left_disp = d_left_disp[i];
         Scalar3 right_disp = d_right_disp[i];
 
-        Scalar3 tangent = left_disp * left_norm + right_disp * right_norm;
+        Scalar3 tangent = left_disp * (left_norm) + right_disp * (right_norm);
 
         d_tangent[i] = tangent;
         }
@@ -110,28 +153,152 @@ struct nudge_kernel
         }
     };
 
+__global__ void gpu_neb_reduce_partial_dot_kernel(const unsigned int N,
+                                                  Scalar3* d_data,
+                                                  Scalar* d_partial_sum)
+    {
+    extern __shared__ Scalar neb_sdata[];
+
+    // determine which particle this thread works on (MEM TRANSFER: 4 bytes)
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+
+    if (idx < N)
+        {
+        neb_sdata[threadIdx.x] = dot(d_data[idx], d_data[idx]);
+        }
+
+    __syncthreads();
+
+    // reduce the sum in parallel
+    int offs = blockDim.x >> 1;
+    while (offs > 0)
+        {
+        if (threadIdx.x < offs)
+            neb_sdata[threadIdx.x] += neb_sdata[threadIdx.x + offs];
+        offs >>= 1;
+        __syncthreads();
+        }
+
+    // write out our partial sum
+    if (threadIdx.x == 0)
+        {
+        d_partial_sum[blockIdx.x] = neb_sdata[0];
+        }
+    }
+
+//! Kernel function for reducing a partial sum to a full sum (one value)
+/*! \param d_sum Placeholder for the sum
+    \param d_partial_sum Array containing the partial sum
+    \param num_blocks Number of blocks to execute
+*/
+__global__ void
+gpu_neb_reduce_partial_sum_inv_sqrt_kernel(Scalar* d_sum, Scalar* d_partial_sum, unsigned int num_blocks)
+    {
+    extern __shared__ Scalar neb_sdata[];
+
+    Scalar sum = Scalar(0.0);
+
+    // sum up the values in the partial sum via a sliding window
+    for (int start = 0; start < num_blocks; start += blockDim.x)
+        {
+        __syncthreads();
+        if (start + threadIdx.x < num_blocks)
+            neb_sdata[threadIdx.x] = d_partial_sum[start + threadIdx.x];
+        else
+            neb_sdata[threadIdx.x] = Scalar(0.0);
+        __syncthreads();
+
+        // reduce the sum in parallel
+        int offs = blockDim.x >> 1;
+        while (offs > 0)
+            {
+            if (threadIdx.x < offs)
+                neb_sdata[threadIdx.x] += neb_sdata[threadIdx.x + offs];
+            offs >>= 1;
+            __syncthreads();
+            }
+
+        // everybody sums up sum2K
+        sum += neb_sdata[0];
+        }
+
+    if (threadIdx.x == 0)
+        *d_sum = 1.0/sqrt(sum);
+    }
+
+__global__ void gpu_neb_reduce_partial_nudge_kernel(const unsigned int N,
+                                                    Scalar k,
+                                                    const Scalar* tangent_norm,
+                                                  const Scalar4* d_net_force,
+                                                  const Scalar3* d_tangent,
+                                                  const Scalar3* d_left_disp,
+                                                  const Scalar3* d_right_disp,
+                                                  Scalar* d_partial_sum)
+    {
+    extern __shared__ Scalar neb_sdata[];
+
+    // determine which particle this thread works on (MEM TRANSFER: 4 bytes)
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+
+    if (idx < N)
+        {
+        Scalar4 f = d_net_force[idx];
+        Scalar3 tangent = d_tangent[idx];
+        Scalar3 left_disp = d_left_disp[idx];
+        Scalar3 right_disp = d_right_disp[idx];
+
+        Scalar3 term = k * (right_disp - left_disp) - make_scalar3(f.x, f.y, f.z);
+        neb_sdata[threadIdx.x] = dot(term, tangent * (*tangent_norm));
+        }
+
+    __syncthreads();
+
+    // reduce the sum in parallel
+    int offs = blockDim.x >> 1;
+    while (offs > 0)
+        {
+        if (threadIdx.x < offs)
+            neb_sdata[threadIdx.x] += neb_sdata[threadIdx.x + offs];
+        offs >>= 1;
+        __syncthreads();
+        }
+
+    // write out our partial sum
+    if (threadIdx.x == 0)
+        {
+        d_partial_sum[blockIdx.x] = neb_sdata[0];
+        }
+    }
+
+
 __global__ void gpu_neb_apply_nudge_kernel(const unsigned int N,
                                             Scalar4 *d_net_force,
                                             const Scalar3 *d_tangent,
-                                            Scalar nudge
+                                            const Scalar nudge,
+                                            const Scalar tangent_norm
                                             )
     {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
 
+    // assert(!isnan(*nudge));
+
     if (i < N)
         {
-        Scalar3 nudge_force = d_tangent[i] * nudge;
+        Scalar3 nudge_force = d_tangent[i] * (nudge) * (tangent_norm);
         d_net_force[i].x += nudge_force.x;
         d_net_force[i].y += nudge_force.y;
         d_net_force[i].z += nudge_force.z;
         }
     }
 
-hipError_t sync() {
-    return hipDeviceSynchronize();
+void sync(const hipStream_t& stream) {
+    hipStreamSynchronize(stream);
+    // hipDeviceSynchronize();
 }
 
-hipError_t gpu_neb_nudge_force(const unsigned int N,
+void gpu_neb_nudge_force(const hipStream_t& stream, const unsigned int N,
                                 const BoxDim& box,
                                 Scalar4* d_net_force,
                                 const Scalar4* d_pos,
@@ -143,7 +310,14 @@ hipError_t gpu_neb_nudge_force(const unsigned int N,
                                 const Scalar4* d_right_pos,
                                 const unsigned int* d_left_rtags,
                                 const unsigned int* d_right_rtags,
-                                const Scalar k)
+                                const Scalar k,
+                                Scalar* d_sum1,
+                                Scalar* d_sum2,
+                                Scalar* d_partial_sum1,
+                                Scalar* d_partial_sum2,
+                                unsigned int reduce_block_size,
+                                unsigned int reduce_num_blocks,
+                                CachedAllocator& alloc)
     {
     
     int block_size = 256;
@@ -168,7 +342,7 @@ hipError_t gpu_neb_nudge_force(const unsigned int N,
                        dim3(grid),
                        dim3(threads),
                        0,
-                       0,
+                       stream,
                        N,
                        box,
                        d_pos,
@@ -180,23 +354,54 @@ hipError_t gpu_neb_nudge_force(const unsigned int N,
                        d_left_rtags,
                        d_right_rtags);
 
-    // std::cout << "3: " << cudaGetErrorString(cudaGetLastError()) << std::endl;
+    // // normalize left disp vectors
+    // hipLaunchKernelGGL((gpu_neb_reduce_partial_dot_kernel),
+    //                     dim3(reduce_num_blocks),
+    //                     dim3(reduce_block_size),
+    //                     reduce_block_size * sizeof(Scalar),
+    //                     stream,
+    //                     N,
+    //                     d_left_disp,
+    //                     d_partial_sum1);
 
-    // hipDeviceSynchronize();
+    // hipLaunchKernelGGL((gpu_neb_reduce_partial_sum_inv_sqrt_kernel),
+    //                     dim3(1, 1, 1),
+    //                     dim3(reduce_block_size),
+    //                     reduce_block_size * sizeof(Scalar),
+    //                     stream,
+    //                     d_sum1,
+    //                     d_partial_sum1,
+    //                     reduce_num_blocks);
 
-    // normalize disp vectors
-    Scalar left_norm = 1.0/sqrt(thrust::transform_reduce(dev_left_disp, dev_left_disp + N, unary_op, 0.0, binary_op));
+    // // normalize right disp vectors
+    // hipLaunchKernelGGL((gpu_neb_reduce_partial_dot_kernel),
+    //                     dim3(reduce_num_blocks),
+    //                     dim3(reduce_block_size),
+    //                     reduce_block_size * sizeof(Scalar),
+    //                     stream,
+    //                     N,
+    //                     d_right_disp,
+    //                     d_partial_sum2);
 
-    Scalar right_norm = 1.0/sqrt(thrust::transform_reduce(dev_right_disp, dev_right_disp + N, unary_op, 0.0, binary_op));
+    // hipLaunchKernelGGL((gpu_neb_reduce_partial_sum_inv_sqrt_kernel),
+    //                     dim3(1, 1, 1),
+    //                     dim3(reduce_block_size),
+    //                     reduce_block_size * sizeof(Scalar),
+    //                     stream,
+    //                     d_sum2,
+    //                     d_partial_sum2,
+    //                     reduce_num_blocks);
 
-    // std::cout << "4: " << cudaGetErrorString(cudaGetLastError()) << std::endl;
+    Scalar left_norm = 1.0/sqrt(thrust::transform_reduce(thrust::cuda::par(alloc).on(stream), dev_left_disp, dev_left_disp + N, unary_op, 0.0, binary_op));
+
+    Scalar right_norm = 1.0/sqrt(thrust::transform_reduce(thrust::cuda::par(alloc).on(stream), dev_right_disp, dev_right_disp + N, unary_op, 0.0, binary_op));
 
     // compute tangent vector (un-normalized)
     hipLaunchKernelGGL((gpu_neb_compute_tangent_kernel),
                         dim3(grid),
                         dim3(threads),
                         0,
-                        0,
+                        stream,
                         N,
                         d_left_disp,
                         d_right_disp,
@@ -204,12 +409,50 @@ hipError_t gpu_neb_nudge_force(const unsigned int N,
                         right_norm,
                         d_tangent);
 
-    hipDeviceSynchronize();
+    // // normalize tangent vector
+    // hipLaunchKernelGGL((gpu_neb_reduce_partial_dot_kernel),
+    //                     dim3(reduce_num_blocks),
+    //                     dim3(reduce_block_size),
+    //                     reduce_block_size * sizeof(Scalar),
+    //                     stream,
+    //                     N,
+    //                     d_tangent,
+    //                     d_partial_sum1);
 
-    // std::cout << "5: " << cudaGetErrorString(cudaGetLastError()) << std::endl;
+    // hipLaunchKernelGGL((gpu_neb_reduce_partial_sum_inv_sqrt_kernel),
+    //                     dim3(1, 1, 1),
+    //                     dim3(reduce_block_size),
+    //                     reduce_block_size * sizeof(Scalar),
+    //                     stream,
+    //                     d_sum1,
+    //                     d_partial_sum1,
+    //                     reduce_num_blocks);
 
-    // normalize tangent vector
-    Scalar tangent_norm = 1.0/sqrt(thrust::transform_reduce(dev_tangent, dev_tangent + N, unary_op, 0.0, binary_op));
+    // compute nudge force partial sum
+    // hipLaunchKernelGGL((gpu_neb_reduce_partial_nudge_kernel),
+    //                     dim3(reduce_num_blocks),
+    //                     dim3(reduce_block_size),
+    //                     reduce_block_size * sizeof(Scalar),
+    //                     stream,
+    //                     N,
+    //                     k,
+    //                     d_sum1,
+    //                     d_net_force,
+    //                     d_tangent,
+    //                     d_left_disp,
+    //                     d_right_disp,
+    //                     d_partial_sum2);
+
+    // hipLaunchKernelGGL((gpu_neb_reduce_partial_sum_kernel),
+    //                     dim3(1, 1, 1),
+    //                     dim3(reduce_block_size),
+    //                     reduce_block_size * sizeof(Scalar),
+    //                     stream,
+    //                     d_sum2,
+    //                     d_partial_sum2,
+    //                     reduce_num_blocks);
+
+    Scalar tangent_norm = 1.0/sqrt(thrust::transform_reduce(thrust::cuda::par(alloc).on(stream), dev_tangent, dev_tangent + N, unary_op, 0.0, binary_op));
 
     // compute nudge force
     // first reduce to get tan and normal force components
@@ -217,23 +460,18 @@ hipError_t gpu_neb_nudge_force(const unsigned int N,
     auto zip_end = zip_begin + N;
     Scalar nudge = thrust::transform_reduce(zip_begin, zip_end, nudge_kernel{k}, 0.0, binary_op);
 
-    // std::cout << "6: " << cudaGetLastError() << std::endl;
-
 
     // then apply to net_force
     hipLaunchKernelGGL((gpu_neb_apply_nudge_kernel),
                         dim3(grid),
                         dim3(threads),
                         0,
-                        0,
+                        stream,
                         N,
                         d_net_force,
                         d_tangent,
-                        nudge);
-
-    // std::cout << "7: " << cudaGetLastError() << std::endl;
-
-    return hipSuccess;
+                        nudge,
+                        tangent_norm);
     }
 
 //! The kernel function to zeros velocities, called by gpu_neb_zero_v()
@@ -288,7 +526,7 @@ __global__ void gpu_neb_zero_angmom_kernel(Scalar4* d_angmom,
 This function is just the driver for gpu_neb_zero_v_kernel(), see that function
 for details.
 */
-hipError_t gpu_neb_zero_v(Scalar4* d_vel, unsigned int* d_group_members, unsigned int group_size)
+void gpu_neb_zero_v(const hipStream_t& stream, Scalar4* d_vel, unsigned int* d_group_members, unsigned int group_size)
     {
     // setup the grid to run the kernel
     int block_size = 256;
@@ -300,16 +538,14 @@ hipError_t gpu_neb_zero_v(Scalar4* d_vel, unsigned int* d_group_members, unsigne
                        dim3(grid),
                        dim3(threads),
                        0,
-                       0,
+                       stream,
                        d_vel,
                        d_group_members,
                        group_size);
-
-    return hipSuccess;
     }
 
-hipError_t
-gpu_neb_zero_angmom(Scalar4* d_angmom, unsigned int* d_group_members, unsigned int group_size)
+void
+gpu_neb_zero_angmom(const hipStream_t& stream, Scalar4* d_angmom, unsigned int* d_group_members, unsigned int group_size)
     {
     // setup the grid to run the kernel
     int block_size = 256;
@@ -321,12 +557,10 @@ gpu_neb_zero_angmom(Scalar4* d_angmom, unsigned int* d_group_members, unsigned i
                        dim3(grid),
                        dim3(threads),
                        0,
-                       0,
+                       stream,
                        d_angmom,
                        d_group_members,
                        group_size);
-
-    return hipSuccess;
     }
 
 //! Kernel function for reducing the potential energy to a partial sum
@@ -380,46 +614,6 @@ __global__ void gpu_neb_reduce_pe_partial_kernel(unsigned int* d_group_members,
         }
     }
 
-//! Kernel function for reducing a partial sum to a full sum (one value)
-/*! \param d_sum Placeholder for the sum
-    \param d_partial_sum Array containing the partial sum
-    \param num_blocks Number of blocks to execute
-*/
-__global__ void
-gpu_neb_reduce_partial_sum_kernel(Scalar* d_sum, Scalar* d_partial_sum, unsigned int num_blocks)
-    {
-    extern __shared__ Scalar neb_sdata[];
-
-    Scalar sum = Scalar(0.0);
-
-    // sum up the values in the partial sum via a sliding window
-    for (int start = 0; start < num_blocks; start += blockDim.x)
-        {
-        __syncthreads();
-        if (start + threadIdx.x < num_blocks)
-            neb_sdata[threadIdx.x] = d_partial_sum[start + threadIdx.x];
-        else
-            neb_sdata[threadIdx.x] = Scalar(0.0);
-        __syncthreads();
-
-        // reduce the sum in parallel
-        int offs = blockDim.x >> 1;
-        while (offs > 0)
-            {
-            if (threadIdx.x < offs)
-                neb_sdata[threadIdx.x] += neb_sdata[threadIdx.x + offs];
-            offs >>= 1;
-            __syncthreads();
-            }
-
-        // everybody sums up sum2K
-        sum += neb_sdata[0];
-        }
-
-    if (threadIdx.x == 0)
-        *d_sum = sum;
-    }
-
 /*!  \param d_group_members Device array listing the indices of the members of the group to
    integrate \param group_size Number of members in the group \param d_net_force Array containing
    the net forces \param d_sum_pe Placeholder for the sum of the PE \param d_partial_sum_pe Array
@@ -429,7 +623,7 @@ gpu_neb_reduce_partial_sum_kernel(Scalar* d_sum, Scalar* d_partial_sum, unsigned
     This is a driver for gpu_neb_reduce_pe_partial_kernel() and
     gpu_neb_reduce_partial_sum_kernel(), see them for details
 */
-hipError_t gpu_neb_compute_sum_pe(unsigned int* d_group_members,
+void gpu_neb_compute_sum_pe(const hipStream_t& stream, unsigned int* d_group_members,
                                    unsigned int group_size,
                                    Scalar4* d_net_force,
                                    Scalar* d_sum_pe,
@@ -446,7 +640,7 @@ hipError_t gpu_neb_compute_sum_pe(unsigned int* d_group_members,
                        dim3(grid),
                        dim3(threads),
                        block_size * sizeof(Scalar),
-                       0,
+                       stream,
                        d_group_members,
                        group_size,
                        d_net_force,
@@ -456,12 +650,10 @@ hipError_t gpu_neb_compute_sum_pe(unsigned int* d_group_members,
                        dim3(1, 1, 1),
                        dim3(threads),
                        block_size * sizeof(Scalar),
-                       0,
+                       stream,
                        d_sum_pe,
                        d_partial_sum_pe,
                        num_blocks);
-
-    return hipSuccess;
     }
 
 //! Kernel function to compute the partial sum over the P term in the NEB algorithm
@@ -785,7 +977,7 @@ __global__ void gpu_neb_reduce_tsq_partial_kernel(const Scalar4* d_net_torque,
     This is a driver for gpu_neb_reduce_{X}_partial_kernel() (where X = P, vsq, asq)
     and gpu_neb_reduce_partial_sum_kernel(), see them for details
 */
-hipError_t gpu_neb_compute_sum_all(const unsigned int N,
+void gpu_neb_compute_sum_all(const hipStream_t& stream, const unsigned int N,
                                     const Scalar4* d_vel,
                                     const Scalar3* d_accel,
                                     unsigned int* d_group_members,
@@ -808,7 +1000,7 @@ hipError_t gpu_neb_compute_sum_all(const unsigned int N,
                        dim3(grid),
                        dim3(threads),
                        block_size * sizeof(Scalar),
-                       0,
+                       stream,
                        d_vel,
                        d_accel,
                        d_group_members,
@@ -819,7 +1011,7 @@ hipError_t gpu_neb_compute_sum_all(const unsigned int N,
                        dim3(grid1),
                        dim3(threads1),
                        block_size * sizeof(Scalar),
-                       0,
+                       stream,
                        &d_sum_all[0],
                        d_partial_sum_P,
                        num_blocks);
@@ -828,7 +1020,7 @@ hipError_t gpu_neb_compute_sum_all(const unsigned int N,
                        dim3(grid),
                        dim3(threads),
                        block_size * sizeof(Scalar),
-                       0,
+                       stream,
                        d_vel,
                        d_group_members,
                        group_size,
@@ -838,7 +1030,7 @@ hipError_t gpu_neb_compute_sum_all(const unsigned int N,
                        dim3(grid1),
                        dim3(threads1),
                        block_size * sizeof(Scalar),
-                       0,
+                       stream,
                        &d_sum_all[1],
                        d_partial_sum_vsq,
                        num_blocks);
@@ -847,7 +1039,7 @@ hipError_t gpu_neb_compute_sum_all(const unsigned int N,
                        dim3(grid),
                        dim3(threads),
                        block_size * sizeof(Scalar),
-                       0,
+                       stream,
                        d_accel,
                        d_group_members,
                        group_size,
@@ -857,15 +1049,15 @@ hipError_t gpu_neb_compute_sum_all(const unsigned int N,
                        dim3(grid1),
                        dim3(threads1),
                        block_size * sizeof(Scalar),
-                       0,
+                       stream,
                        &d_sum_all[2],
                        d_partial_sum_asq,
                        num_blocks);
 
-    return hipSuccess;
+    
     }
 
-hipError_t gpu_neb_compute_sum_all_angular(const unsigned int N,
+void gpu_neb_compute_sum_all_angular(const hipStream_t& stream, const unsigned int N,
                                             const Scalar4* d_orientation,
                                             const Scalar3* d_inertia,
                                             const Scalar4* d_angmom,
@@ -890,7 +1082,7 @@ hipError_t gpu_neb_compute_sum_all_angular(const unsigned int N,
                        dim3(grid),
                        dim3(threads),
                        block_size * sizeof(Scalar),
-                       0,
+                       stream,
                        d_angmom,
                        d_orientation,
                        d_inertia,
@@ -903,7 +1095,7 @@ hipError_t gpu_neb_compute_sum_all_angular(const unsigned int N,
                        dim3(grid1),
                        dim3(threads1),
                        block_size * sizeof(Scalar),
-                       0,
+                       stream,
                        &d_sum_all[0],
                        d_partial_sum_Pr,
                        num_blocks);
@@ -912,7 +1104,7 @@ hipError_t gpu_neb_compute_sum_all_angular(const unsigned int N,
                        dim3(grid),
                        dim3(threads),
                        block_size * sizeof(Scalar),
-                       0,
+                       stream,
                        d_angmom,
                        d_orientation,
                        d_group_members,
@@ -923,7 +1115,7 @@ hipError_t gpu_neb_compute_sum_all_angular(const unsigned int N,
                        dim3(grid1),
                        dim3(threads1),
                        block_size * sizeof(Scalar),
-                       0,
+                       stream,
                        &d_sum_all[1],
                        d_partial_sum_wnorm,
                        num_blocks);
@@ -932,7 +1124,7 @@ hipError_t gpu_neb_compute_sum_all_angular(const unsigned int N,
                        dim3(grid),
                        dim3(threads),
                        block_size * sizeof(Scalar),
-                       0,
+                       stream,
                        d_net_torque,
                        d_orientation,
                        d_inertia,
@@ -944,12 +1136,12 @@ hipError_t gpu_neb_compute_sum_all_angular(const unsigned int N,
                        dim3(grid1),
                        dim3(threads1),
                        block_size * sizeof(Scalar),
-                       0,
+                       stream,
                        &d_sum_all[2],
                        d_partial_sum_tsq,
                        num_blocks);
 
-    return hipSuccess;
+    
     }
 
 //! Kernel function to update the velocities used by the NEB algorithm
@@ -996,7 +1188,7 @@ __global__ void gpu_neb_update_v_kernel(Scalar4* d_vel,
 
     This function is a driver for gpu_neb_update_v_kernel(), see it for details.
 */
-hipError_t gpu_neb_update_v(Scalar4* d_vel,
+void gpu_neb_update_v(const hipStream_t& stream, Scalar4* d_vel,
                              const Scalar3* d_accel,
                              unsigned int* d_group_members,
                              unsigned int group_size,
@@ -1013,7 +1205,7 @@ hipError_t gpu_neb_update_v(Scalar4* d_vel,
                        dim3(grid),
                        dim3(threads),
                        0,
-                       0,
+                       stream,
                        d_vel,
                        d_accel,
                        d_group_members,
@@ -1021,7 +1213,7 @@ hipError_t gpu_neb_update_v(Scalar4* d_vel,
                        alpha,
                        factor_t);
 
-    return hipSuccess;
+    
     }
 
 __global__ void gpu_neb_update_angmom_kernel(const Scalar4* d_net_torque,
@@ -1067,7 +1259,7 @@ __global__ void gpu_neb_update_angmom_kernel(const Scalar4* d_net_torque,
         }
     }
 
-hipError_t gpu_neb_update_angmom(const Scalar4* d_net_torque,
+void gpu_neb_update_angmom(const hipStream_t& stream, const Scalar4* d_net_torque,
                                   const Scalar4* d_orientation,
                                   const Scalar3* d_inertia,
                                   Scalar4* d_angmom,
@@ -1086,7 +1278,7 @@ hipError_t gpu_neb_update_angmom(const Scalar4* d_net_torque,
                        dim3(grid),
                        dim3(threads),
                        0,
-                       0,
+                       stream,
                        d_net_torque,
                        d_orientation,
                        d_inertia,
@@ -1096,7 +1288,7 @@ hipError_t gpu_neb_update_angmom(const Scalar4* d_net_torque,
                        alpha,
                        factor_r);
 
-    return hipSuccess;
+    
     }
 
     } // end namespace kernel

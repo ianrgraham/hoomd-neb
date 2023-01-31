@@ -31,31 +31,21 @@ void NEBHookGPU::update(uint64_t timestep)
 
     // Arrive at the start of the integration step to synchronize the nudging of forces
     m_neb->m_do_integration = true;
+    
     if (m_neb->m_nudge)
         {
-        kernel::sync();
-        {
-            // pybind11::gil_scoped_acquire acquire;
-            // std::cout << timestep << "at barrier 1" << std::endl;
-        }
+        kernel::sync(m_exec_conf->getStream());
         m_neb->arriveAndWaitAtBarriers();
-        {
-            // pybind11::gil_scoped_acquire acquire;
-            // std::cout << timestep << "computing nudge" << std::endl;
-        }
 
         m_neb->m_do_integration = m_neb->nudgeForce(timestep);
-        kernel::sync();
+        kernel::sync(m_exec_conf->getStream());
         m_neb->arriveAndWaitAtBarriers();
-        {
-            // pybind11::gil_scoped_acquire acquire;
-            // std::cout << timestep << "passed barrier 2" << std::endl;
-        }
         }
     }
 
 void NEBHookGPU::setSystemDefinition(std::shared_ptr<SystemDefinition> sysdef)
     {
+    m_exec_conf = sysdef->getParticleData()->getExecConf();
     }
 
 /*! \param sysdef SystemDefinition this method will act on. Must not be NULL.
@@ -79,10 +69,18 @@ NEBEnergyMinimizerGPU::NEBEnergyMinimizerGPU(std::shared_ptr<SystemDefinition> s
     GPUArray<Scalar> sum3(3, m_exec_conf);
     m_sum3.swap(sum3);
 
+    GPUArray<Scalar> neb_sum1(1, m_exec_conf);
+    m_neb_sum1.swap(neb_sum1);
+    GPUArray<Scalar> neb_sum2(1, m_exec_conf);
+    m_neb_sum2.swap(neb_sum2);
+
     // initialize the partial sum arrays
     m_partial_sum1 = GPUVector<Scalar>(m_exec_conf);
     m_partial_sum2 = GPUVector<Scalar>(m_exec_conf);
     m_partial_sum3 = GPUVector<Scalar>(m_exec_conf);
+
+    m_neb_partial_sum1 = GPUVector<Scalar>(m_exec_conf);
+    m_neb_partial_sum2 = GPUVector<Scalar>(m_exec_conf);
 
     reset();
 
@@ -97,6 +95,8 @@ bool NEBEnergyMinimizerGPU::nudgeForce(uint64_t timestep)
         {
         return false;
         }
+    auto N = m_pdata->getN();
+    resizeNEBPartialSumArrays(N);
 
     // get the neighbor positions and tags to assess the configuration space tangent vector
     const GlobalArray<Scalar4>& net_force = m_pdata->getNetForce();
@@ -110,32 +110,31 @@ bool NEBEnergyMinimizerGPU::nudgeForce(uint64_t timestep)
     ArrayHandle<Scalar3> d_left_disp(m_left_disp_buffer, access_location::device, access_mode::readwrite);
     ArrayHandle<Scalar3> d_right_disp(m_right_disp_buffer, access_location::device, access_mode::readwrite);
 
-    Scalar left_norm = 0.0;
-    Scalar right_norm = 0.0;
-    Scalar tangent_norm = 0.0;
-
-    Scalar tan_force = 0.0;
-    Scalar norm_force = 0.0;
+    ArrayHandle<Scalar> d_neb_partial_sum1(m_neb_partial_sum1, access_location::device, access_mode::overwrite);
+    ArrayHandle<Scalar> d_neb_partial_sum2(m_neb_partial_sum2, access_location::device, access_mode::overwrite);
+    ArrayHandle<Scalar> d_neb_sum1(m_neb_sum1, access_location::device, access_mode::overwrite);
+    ArrayHandle<Scalar> d_neb_sum2(m_neb_sum2, access_location::device, access_mode::overwrite);
 
     // get info from left and right minimizers
     auto left_pdata = m_left_minimizer->get()->getParticleData();
     auto right_pdata = m_right_minimizer->get()->getParticleData();
 
-    GlobalArray<Scalar4> left_pos = left_pdata->getPositions();
-    GlobalArray<Scalar4> right_pos = right_pdata->getPositions();
+    const GlobalArray<Scalar4>& left_pos = left_pdata->getPositions();
+    const GlobalArray<Scalar4>& right_pos = right_pdata->getPositions();
 
     ArrayHandle<Scalar4> d_left_pos(left_pos, access_location::device, access_mode::read);
     ArrayHandle<Scalar4> d_right_pos(right_pos, access_location::device, access_mode::read);
 
-    GlobalArray<unsigned int> left_rtags = left_pdata->getRTags();
-    GlobalArray<unsigned int> right_rtags = right_pdata->getRTags();
+    const GlobalArray<unsigned int>& left_rtags = left_pdata->getRTags();
+    const GlobalArray<unsigned int>& right_rtags = right_pdata->getRTags();
 
     ArrayHandle<unsigned int> d_left_rtags(left_rtags, access_location::device, access_mode::read);
     ArrayHandle<unsigned int> d_right_rtags(right_rtags, access_location::device, access_mode::read);
 
     auto global_box = m_pdata->getGlobalBox();
 
-    kernel::gpu_neb_nudge_force(m_pdata->getN(),
+    auto num_block = N / m_block_size + 1;
+    kernel::gpu_neb_nudge_force(m_exec_conf->getStream(), N,
                         global_box,
                         d_net_force.data,
                         d_pos.data,
@@ -147,12 +146,29 @@ bool NEBEnergyMinimizerGPU::nudgeForce(uint64_t timestep)
                         d_right_pos.data,
                         d_left_rtags.data,
                         d_right_rtags.data,
-                        m_k);
+                        m_k,
+                        d_neb_sum1.data,
+                        d_neb_sum2.data,
+                        d_neb_partial_sum1.data,
+                        d_neb_partial_sum2.data,
+                        m_block_size,
+                        num_block,
+                        m_exec_conf->getCachedAllocator());
     
     if (m_exec_conf->isCUDAErrorCheckingEnabled())
         CHECK_CUDA_ERROR();
 
     return true;
+    }
+
+void NEBEnergyMinimizerGPU::resizeNEBPartialSumArrays(unsigned int N)
+    {
+    unsigned int num_blocks = N / m_block_size + 1;
+    if (num_blocks != m_neb_partial_sum1.size())
+        {
+        m_neb_partial_sum1.resize(num_blocks);
+        m_neb_partial_sum2.resize(num_blocks);
+        }
     }
 
 /*
@@ -226,7 +242,7 @@ void NEBEnergyMinimizerGPU::update(uint64_t timestep)
             ArrayHandle<Scalar> d_sumE(m_sum, access_location::device, access_mode::overwrite);
 
             unsigned int num_blocks = group_size / m_block_size + 1;
-            kernel::gpu_neb_compute_sum_pe(d_index_array.data,
+            kernel::gpu_neb_compute_sum_pe(m_exec_conf->getStream(), d_index_array.data,
                                             group_size,
                                             d_net_force.data,
                                             d_sumE.data,
@@ -312,7 +328,7 @@ void NEBEnergyMinimizerGPU::update(uint64_t timestep)
 
                 unsigned int num_blocks = group_size / m_block_size + 1;
 
-                kernel::gpu_neb_compute_sum_all(m_pdata->getN(),
+                kernel::gpu_neb_compute_sum_all(m_exec_conf->getStream(), m_pdata->getN(),
                                                 d_vel.data,
                                                 d_accel.data,
                                                 d_index_array.data,
@@ -366,7 +382,7 @@ void NEBEnergyMinimizerGPU::update(uint64_t timestep)
 
                     unsigned int num_blocks = group_size / m_block_size + 1;
 
-                    kernel::gpu_neb_compute_sum_all_angular(m_pdata->getN(),
+                    kernel::gpu_neb_compute_sum_all_angular(m_exec_conf->getStream(), m_pdata->getN(),
                                                             d_orientation.data,
                                                             d_inertia.data,
                                                             d_angmom.data,
@@ -489,7 +505,7 @@ void NEBEnergyMinimizerGPU::update(uint64_t timestep)
                                         access_location::device,
                                         access_mode::read);
 
-            kernel::gpu_neb_update_v(d_vel.data,
+            kernel::gpu_neb_update_v(m_exec_conf->getStream(), d_vel.data,
                                     d_accel.data,
                                     d_index_array.data,
                                     group_size,
@@ -515,7 +531,7 @@ void NEBEnergyMinimizerGPU::update(uint64_t timestep)
                                             access_location::device,
                                             access_mode::read);
 
-                kernel::gpu_neb_update_angmom(d_net_torque.data,
+                kernel::gpu_neb_update_angmom(m_exec_conf->getStream(), d_net_torque.data,
                                             d_orientation.data,
                                             d_inertia.data,
                                             d_angmom.data,
@@ -559,7 +575,7 @@ void NEBEnergyMinimizerGPU::update(uint64_t timestep)
                                         access_location::device,
                                         access_mode::readwrite);
 
-                kernel::gpu_neb_zero_v(d_vel.data, d_index_array.data, group_size);
+                kernel::gpu_neb_zero_v(m_exec_conf->getStream(), d_vel.data, d_index_array.data, group_size);
                 if (m_exec_conf->isCUDAErrorCheckingEnabled())
                     CHECK_CUDA_ERROR();
 
@@ -569,7 +585,7 @@ void NEBEnergyMinimizerGPU::update(uint64_t timestep)
                     ArrayHandle<Scalar4> d_angmom(m_pdata->getAngularMomentumArray(),
                                                 access_location::device,
                                                 access_mode::readwrite);
-                    kernel::gpu_neb_zero_angmom(d_angmom.data, d_index_array.data, group_size);
+                    kernel::gpu_neb_zero_angmom(m_exec_conf->getStream(), d_angmom.data, d_index_array.data, group_size);
                     if (m_exec_conf->isCUDAErrorCheckingEnabled())
                         CHECK_CUDA_ERROR();
                     }
@@ -590,7 +606,7 @@ void NEBEnergyMinimizerGPU::update(uint64_t timestep)
                                                     access_location::device,
                                                     access_mode::read);
 
-            kernel::gpu_neb_zero_v(d_vel.data, d_index_array.data, group_size);
+            kernel::gpu_neb_zero_v(m_exec_conf->getStream(), d_vel.data, d_index_array.data, group_size);
             if (m_exec_conf->isCUDAErrorCheckingEnabled())
                 CHECK_CUDA_ERROR();
 
@@ -600,7 +616,7 @@ void NEBEnergyMinimizerGPU::update(uint64_t timestep)
                 ArrayHandle<Scalar4> d_angmom(m_pdata->getAngularMomentumArray(),
                                             access_location::device,
                                             access_mode::readwrite);
-                kernel::gpu_neb_zero_angmom(d_angmom.data, d_index_array.data, group_size);
+                kernel::gpu_neb_zero_angmom(m_exec_conf->getStream(), d_angmom.data, d_index_array.data, group_size);
                 if (m_exec_conf->isCUDAErrorCheckingEnabled())
                     CHECK_CUDA_ERROR();
                 }
